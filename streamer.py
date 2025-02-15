@@ -4,10 +4,11 @@ from lossy_socket import LossyUDP
 from socket import INADDR_ANY
 import struct
 from concurrent.futures import ThreadPoolExecutor
-from time import sleep
+from time import sleep, time
 
 class Streamer:
-    HEADER_FORMAT = "!BI" # 1 byte for type (0=data, 1=ACK), 4 bytes for seq number
+    # Packet type 0=Data, 1=ACK, 2=FIN, 3=FIN ACK
+    HEADER_FORMAT = "!BI" # 1 byte for packet type, 4 bytes for seq number
     HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
     MAX_PACKET_SIZE = 1472 # header + payload
     MAX_PAYLOAD = MAX_PACKET_SIZE - HEADER_SIZE # size of actual payload per packet
@@ -32,6 +33,11 @@ class Streamer:
         # ACK variables
         self.awaiting_ack = False # flag for if we're waiting for ACK
         self.awaiting_ack_seq = None # seq num of ACK we are waiting for
+
+        # FIN variables
+        self.awaiting_fin_ack = False
+        self.awaiting_fin_ack_seq = None
+        self.received_fin = False
         
         # background listener thread
         executor = ThreadPoolExecutor(max_workers=1)
@@ -62,7 +68,19 @@ class Streamer:
                     ack_header = struct.pack(self.HEADER_FORMAT, 1, seq)
                     self.socket.sendto(ack_header, addr)
                     print(f"[Listener] Sent ACK for seq {seq}")
-               
+                elif packet_type == 2:
+                    # FIN packet
+                    print(f"[Listener] Received FIN with seq {seq}")
+                    # send FIN ACK 
+                    fin_ack_header = struct.pack(self.HEADER_FORMAT, 3, seq)
+                    self.socket.sendto(fin_ack_header, addr)
+                    print(f"[Listener] Sent FIN ACK for seq {seq}")
+                    self.received_fin = True
+                elif packet_type == 3:
+                    # FIN ACK packet
+                    print(f"[Listener] Received FIN ACK for seq {seq}")
+                    if self.awaiting_fin_ack_seq is not None and seq == self.awaiting_fin_ack_seq:
+                        self.awaiting_fin_ack = True
             except Exception as e:
                 print("listener died")
                 print(e)
@@ -80,9 +98,15 @@ class Streamer:
             self.awaiting_ack_seq = self.next_seq
             print(f"[Send] Sending packet with seq {self.next_seq}")
             self.socket.sendto(packet, (self.dst_ip, self.dst_port)) 
-            # wait until listener says an ACK has been received
+            # wait for ACK, timeout .25 secs
+            start_time = time()
             while not self.awaiting_ack:
                 sleep(0.01)
+                if time() - start_time >= 0.25:
+                    print(f"[Send] Timed out waiting for ACK for seq {self.awaiting_ack_seq}, resending")
+                    # retransmit packet
+                    self.socket.sendto(packet, (self.dst_ip, self.dst_port))
+                    start_time = time() # reset time on retransmission
             print(f"[Send] ACK received for seq {self.next_seq}")
             self.next_seq += 1 # increment sequence number
 
@@ -104,5 +128,33 @@ class Streamer:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
         # your code goes here, especially after you add ACKs and retransmissions.
+
+        # use next seq num  for fin seq
+        fin_seq = self.next_seq
+        # construct fin header
+        fin_header = struct.pack(self.HEADER_FORMAT, 2, fin_seq)
+        self.awaiting_fin_ack = False
+        self.awaiting_fin_ack_seq = fin_seq
+
+        # send fin until fin ack is received
+        while not self.awaiting_fin_ack:
+            print("[Close] Sending FIN packet with seq {fin_seq}")
+            self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
+            start_time = time()
+            while not self.awaiting_fin_ack and time() - start_time < 0.25:
+                sleep(0.01)
+            if not self.awaiting_fin_ack:
+                print("[Close] Timeout waiting for FIN ACK, resending FIN")
+            print("[Close] FIN ACK received. Waiting for FIN from remote.")
+
+        start_time = time()
+        while not self.received_fin and time() - start_time < 10:
+            sleep(0.01)
+        if self.received_fin:
+            print("[Close] FIN from remote received. Waiting 2 seconds before shutdown.")
+            sleep(2)
+        else: 
+            print("[Close] Did not receive FIN from remote within timeout.")
+
         self.closed = True
         self.socket.stoprecv()
