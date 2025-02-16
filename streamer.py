@@ -6,9 +6,11 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from time import sleep, time
 
+import hashlib # for part 4 
+
 class Streamer:
     # Packet type 0=Data, 1=ACK, 2=FIN, 3=FIN ACK
-    HEADER_FORMAT = "!BI" # 1 byte for packet type, 4 bytes for seq number
+    HEADER_FORMAT = "!BI16s"  # turned to 16 bits for hash # 1 byte for packet type, 4 bytes for seq number
     HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
     MAX_PACKET_SIZE = 1472 # header + payload
     MAX_PAYLOAD = MAX_PACKET_SIZE - HEADER_SIZE # size of actual payload per packet
@@ -51,28 +53,42 @@ class Streamer:
                 if len(packet) < self.HEADER_SIZE:
                     continue
                 # unpack header to get packet type and seq num
-                packet_type, seq = struct.unpack(self.HEADER_FORMAT, packet[:self.HEADER_SIZE])
+                packet_type, seq = struct.unpack("!BI", packet[:5]) #geteverythign except hash 
+
+                if packet_type == 0:  # Data packet (expects a hash)
+                    if len(packet) < self.HEADER_SIZE:
+                        continue
+                    packet_type, seq, received_hash = struct.unpack(self.HEADER_FORMAT, packet[:self.HEADER_SIZE])
+                    payload = packet[self.HEADER_SIZE:]
+
+                    computedhash = hashlib.md5(payload).digest() #get hash (from documentaiton )
+                    if received_hash != computedhash: #if the has h not equal
+                        print(f"[Listener] Packet {seq} has wrong hash, discard.")
+                        continue  #discard
+
+                    #store packet that passed hash check 
+                    print(f"[Listener] Received valid data packet {seq}")
+                    if seq not in self.recv_buffer:
+                        self.recv_buffer[seq] = payload
+
+                    # send ackwith empty hash (same as part 3 but with has)
+                    ack_header = struct.pack(self.HEADER_FORMAT, 1, seq, b'\x00' * 16)
+                    self.socket.sendto(ack_header, addr)
+                    print(f"[Listener] Sent ACK for seq {seq}")
+
+
+
                 if packet_type == 1:
                     # ACK packet
                     print(f"[Listener] Received ACK for seq {seq}")
                     if self.awaiting_ack_seq is not None and seq == self.awaiting_ack_seq:
                         self.awaiting_ack = True
-                elif packet_type == 0:
-                    # data packet
-                    print(f"[Listener] Received data packet with seq {seq}")
-                    payload = packet[self.HEADER_SIZE:]
-                    # add to buffer if not already received
-                    if seq not in self.recv_buffer:
-                        self.recv_buffer[seq] = payload
-                    # send back an ACK for this packet
-                    ack_header = struct.pack(self.HEADER_FORMAT, 1, seq)
-                    self.socket.sendto(ack_header, addr)
-                    print(f"[Listener] Sent ACK for seq {seq}")
+
                 elif packet_type == 2:
                     # FIN packet
                     print(f"[Listener] Received FIN with seq {seq}")
                     # send FIN ACK 
-                    fin_ack_header = struct.pack(self.HEADER_FORMAT, 3, seq)
+                    fin_ack_header = struct.pack(self.HEADER_FORMAT, 3, seq, b'\x00' * 16) #add empty hash 
                     self.socket.sendto(fin_ack_header, addr)
                     print(f"[Listener] Sent FIN ACK for seq {seq}")
                     self.received_fin = True
@@ -90,13 +106,20 @@ class Streamer:
         # Your code goes here!  The code below should be changed!
         for i in range(0, len(data_bytes), self.MAX_PAYLOAD):
             chunk = data_bytes[i:i + self.MAX_PAYLOAD] # take size of max segment - header size
+
+
+
+            hash = hashlib.md5(chunk).digest() #fpr part 4 (referred to the documentation)
+
+
+
             # create header for data packet with type 0 and seq num
-            header = struct.pack(self.HEADER_FORMAT, 0, self.next_seq) 
+            header = struct.pack(self.HEADER_FORMAT, 0, self.next_seq, hash) 
             packet = header + chunk # construct full packet, header + payload
             # set up ACK waiting
             self.awaiting_ack = False
             self.awaiting_ack_seq = self.next_seq
-            print(f"[Send] Sending packet with seq {self.next_seq}")
+            print(f"[Send] Sending packet with seq {self.next_seq}, hash {hash.hex()}") #print hash as hex
             self.socket.sendto(packet, (self.dst_ip, self.dst_port)) 
             # wait for ACK, timeout .25 secs
             start_time = time()
@@ -132,23 +155,24 @@ class Streamer:
         # use next seq num  for fin seq
         fin_seq = self.next_seq
         # construct fin header
-        fin_header = struct.pack(self.HEADER_FORMAT, 2, fin_seq)
+        fin_header = struct.pack(self.HEADER_FORMAT, 2, fin_seq, b'\x00' * 16) #added empty hash for part 4 
+ 
         self.awaiting_fin_ack = False
         self.awaiting_fin_ack_seq = fin_seq
 
         # send fin until fin ack is received
         while not self.awaiting_fin_ack:
-            print("[Close] Sending FIN packet with seq {fin_seq}")
+            print(f"[Close] Sending FIN packet with seq {fin_seq}")
             self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
             start_time = time()
             while not self.awaiting_fin_ack and time() - start_time < 0.25:
                 sleep(0.01)
             if not self.awaiting_fin_ack:
                 print("[Close] Timeout waiting for FIN ACK, resending FIN")
-            print("[Close] FIN ACK received. Waiting for FIN from remote.")
+
 
         start_time = time()
-        while not self.received_fin and time() - start_time < 10:
+        while not (self.received_fin and self.awaiting_fin_ack) and time() - start_time < 10: #wait for both a FINACK and the remote FIN
             sleep(0.01)
         if self.received_fin:
             print("[Close] FIN from remote received. Waiting 2 seconds before shutdown.")
